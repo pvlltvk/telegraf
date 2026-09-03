@@ -73,6 +73,15 @@ metrics can be gathered using the udp connection.
   - root_delay (float, seconds)
   - root_dispersion (float, seconds)
   - update_interval (float, seconds)
+- chrony_sources_summary (only when `sources` is enabled)
+  - total (integer, number of configured sources)
+  - sync (integer, sources currently used for synchronization, `*` in chronyc)
+  - candidate (integer, sources combined with the selected one, `+` in chronyc)
+  - outlier (integer, sources excluded by the combining algorithm, `-` in chronyc)
+  - unreachable (integer, sources that could not be reached, `?` in chronyc)
+  - falseticker (integer, sources considered false tickers, `x` in chronyc)
+  - jittery (integer, sources with too much variability, `~` in chronyc)
+  - reachable (integer, sum of `sync`, `candidate` and `outlier`)
 
 ### Tags
 
@@ -85,4 +94,5 @@ metrics can be gathered using the udp connection.
 
 ```text
 chrony,leap_status=not\ synchronized,reference_id=A29FC87B,stratum=3 frequency=-16.000999450683594,last_offset=0.000012651000361074694,residual_freq=0,rms_offset=0.000025576999178156257,root_delay=0.0016550000291317701,root_dispersion=0.00330700003542006,skew=0.006000000052154064,system_time=0.000020389999917824753,update_interval=507.1999816894531 1706271167571675297
+chrony_sources_summary candidate=2i,falseticker=0i,jittery=0i,outlier=1i,reachable=4i,sync=1i,total=4i,unreachable=0i 1706271167571675297
 ```

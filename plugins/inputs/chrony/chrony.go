@@ -412,6 +412,9 @@ func (c *Chrony) gatherSources(acc telegraf.Accumulator) error {
 		return fmt.Errorf("got unexpected response type %T while waiting for sources", sourcesRaw)
 	}
 
+	// Count the sources by state to provide a summary
+	var synced, candidates, outliers, unreachable, falsetickers, jittery int
+
 	for idx := int32(0); int(idx) < sourcesResp.NSources; idx++ {
 		// Getting the source data
 		sourceDataReq := fbchrony.NewSourceDataPacket(idx)
@@ -465,7 +468,40 @@ func (c *Chrony) gatherSources(acc telegraf.Accumulator) error {
 			"latest_measurement_error": sourceData.LatestMeasErr,
 		}
 		acc.AddFields("chrony_sources", fields, tags)
+
+		// Update the summary counters using the same terminology as chronyc
+		switch sourceData.State {
+		case fbchrony.SourceStateSync:
+			synced++
+		case fbchrony.SourceStateCandidate:
+			candidates++
+		case fbchrony.SourceStateOutlier:
+			outliers++
+		case fbchrony.SourceStateUnreach:
+			unreachable++
+		case fbchrony.SourceStateFalseTicker:
+			falsetickers++
+		case fbchrony.SourceStateJittery:
+			jittery++
+		}
 	}
+
+	tags := make(map[string]string, 1)
+	if c.source != "" {
+		tags["source"] = c.source
+	}
+	fields := map[string]interface{}{
+		"total":       sourcesResp.NSources,
+		"sync":        synced,
+		"candidate":   candidates,
+		"outlier":     outliers,
+		"unreachable": unreachable,
+		"falseticker": falsetickers,
+		"jittery":     jittery,
+		"reachable":   synced + candidates + outliers,
+	}
+	acc.AddFields("chrony_sources_summary", fields, tags)
+
 	return nil
 }
 
