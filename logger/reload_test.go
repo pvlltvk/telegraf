@@ -1,6 +1,7 @@
 package logger
 
 import (
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -45,4 +46,14 @@ func TestLoggingReconfigurationWhileWriting(t *testing.T) {
 		require.True(t, sink.closed)
 		require.False(t, sink.writtenAfterClose)
 	}
+}
+
+func TestLoggingValidationDoesNotOpenSink(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing", "telegraf.log")
+	previous := instance
+	cfg := &Config{LogFormat: "text", LogTarget: "file", Logfile: path}
+	require.NoError(t, cfg.Validate())
+	require.Same(t, previous, instance)
+	require.NoFileExists(t, path)
+	require.NoDirExists(t, filepath.Dir(path))
 }

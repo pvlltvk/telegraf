@@ -226,27 +226,16 @@ type Config struct {
 
 	// internal  log-level
 	logLevel telegraf.LogLevel
+	timezone *time.Location
 }
 
-// SetupLogging configures the logging output.
-func SetupLogging(cfg *Config) error {
-	// Issue deprecation warning for option
+// Validate normalizes logging settings without opening or replacing a sink.
+func (cfg *Config) Validate() error {
 	switch cfg.LogTarget {
-	case "":
-		// Best-case no target set or file already migrated...
+	case "", "file":
 	case "stderr":
-		msg := "Agent setting %q is deprecated, please leave %q empty and remove this setting!"
-		deprecation := "The setting will be removed in v1.40.0."
-		log.Printf("W! "+msg+" "+deprecation, "logtarget", "logfile")
 		cfg.Logfile = ""
-	case "file":
-		msg := "Agent setting %q is deprecated, please just set %q and remove this setting!"
-		deprecation := "The setting will be removed in v1.40.0."
-		log.Printf("W! "+msg+" "+deprecation, "logtarget", "logfile")
 	case "eventlog":
-		msg := "Agent setting %q is deprecated, please set %q to %q and remove this setting!"
-		deprecation := "The setting will be removed in v1.40.0."
-		log.Printf("W! "+msg+" "+deprecation, "logtarget", "logformat", "eventlog")
 		if cfg.LogFormat != "" && cfg.LogFormat != "eventlog" {
 			return errors.New("contradicting setting between 'logtarget' and 'logformat'")
 		}
@@ -254,11 +243,9 @@ func SetupLogging(cfg *Config) error {
 	default:
 		return fmt.Errorf("invalid deprecated 'logtarget' setting %q", cfg.LogTarget)
 	}
-
 	if cfg.LogFormat == "" {
 		cfg.LogFormat = "text"
 	}
-
 	if cfg.Debug {
 		cfg.logLevel = telegraf.Debug
 	}
@@ -268,16 +255,9 @@ func SetupLogging(cfg *Config) error {
 	if !cfg.Debug && !cfg.Quiet {
 		cfg.logLevel = telegraf.Info
 	}
-
 	if cfg.InstanceName == "" {
 		cfg.InstanceName = "telegraf"
 	}
-
-	if cfg.LogFormat == "" {
-		cfg.LogFormat = "text"
-	}
-
-	// Get configured timezone
 	timezoneName := cfg.LogWithTimezone
 	if strings.EqualFold(timezoneName, "local") {
 		timezoneName = "Local"
@@ -286,21 +266,40 @@ func SetupLogging(cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("setting logging timezone failed: %w", err)
 	}
-
-	// Get the logging factory and create the root instance
-	creator, found := registry[cfg.LogFormat]
-	if !found {
+	if _, found := registry[cfg.LogFormat]; !found {
 		return fmt.Errorf("unsupported log-format: %s", cfg.LogFormat)
 	}
+	cfg.timezone = tz
+	return nil
+}
 
-	l, err := creator(cfg)
+// SetupLogging configures the logging output.
+func SetupLogging(cfg *Config) error {
+	// Issue deprecation warning for option
+	switch cfg.LogTarget {
+	case "stderr":
+		msg := "Agent setting %q is deprecated, please leave %q empty and remove this setting!"
+		deprecation := "The setting will be removed in v1.40.0."
+		log.Printf("W! "+msg+" "+deprecation, "logtarget", "logfile")
+	case "file":
+		msg := "Agent setting %q is deprecated, please just set %q and remove this setting!"
+		deprecation := "The setting will be removed in v1.40.0."
+		log.Printf("W! "+msg+" "+deprecation, "logtarget", "logfile")
+	case "eventlog":
+		msg := "Agent setting %q is deprecated, please set %q to %q and remove this setting!"
+		deprecation := "The setting will be removed in v1.40.0."
+		log.Printf("W! "+msg+" "+deprecation, "logtarget", "logformat", "eventlog")
+	}
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	l, err := registry[cfg.LogFormat](cfg)
 	if err != nil {
 		return err
 	}
-
 	// Update the logging instance
 	skipEarlyLogs := cfg.LogFormat == "text" && cfg.Logfile == ""
-	return instance.switchSink(l, cfg.logLevel, tz, skipEarlyLogs)
+	return instance.switchSink(l, cfg.logLevel, cfg.timezone, skipEarlyLogs)
 }
 
 func RedirectLogging(w io.Writer) {

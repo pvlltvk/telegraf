@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -665,4 +666,32 @@ func TestFlagsAreSet(t *testing.T) {
 	require.Equal(t, expectedInt, m.testWait)
 	require.Equal(t, expectedString, m.watchConfig)
 	require.Equal(t, expectedString, m.pidFile)
+}
+
+func TestConfigURLTimeout(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		expected time.Duration
+		err      string
+	}{
+		{name: "default", expected: 30 * time.Second},
+		{name: "custom", args: []string{"--config-url-timeout", "5s"}, expected: 5 * time.Second},
+		{name: "zero", args: []string{"--config-url-timeout", "0s"}, err: "config-url-timeout must be positive"},
+		{name: "negative", args: []string{"--config-url-timeout", "-1s"}, err: "config-url-timeout must be positive"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			buf := new(bytes.Buffer)
+			args := append([]string{os.Args[0]}, tt.args...)
+			m := NewMockTelegraf()
+			err := runApp(args, buf, NewMockServer(), NewMockConfig(buf), m)
+			if tt.err != "" {
+				require.EqualError(t, err, tt.err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.expected, m.configURLTimeout)
+		})
+	}
 }

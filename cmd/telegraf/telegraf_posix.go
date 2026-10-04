@@ -12,11 +12,6 @@ func (t *Telegraf) Run() error {
 	stop = make(chan struct{})
 	defer close(stop)
 
-	cfg, err := t.loadConfiguration()
-	if err != nil {
-		return err
-	}
-	t.cfg = cfg
 	return t.reloadLoop()
 }
 

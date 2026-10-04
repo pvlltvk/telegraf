@@ -87,10 +87,14 @@ services with different configurations use
 						},
 					},
 					Action: func(cCtx *cli.Context) error {
+						if cCtx.Duration("config-url-timeout") <= 0 {
+							return errors.New("config-url-timeout must be positive")
+						}
 						cfg := &serviceConfig{
-							displayName:  cCtx.String("display-name"),
-							restartDelay: cCtx.String("restart-delay"),
-							autoRestart:  cCtx.Bool("auto-restart"),
+							configURLTimeout: cCtx.Duration("config-url-timeout"),
+							displayName:      cCtx.String("display-name"),
+							restartDelay:     cCtx.String("restart-delay"),
+							autoRestart:      cCtx.Bool("auto-restart"),
 
 							configs:    cCtx.StringSlice("config"),
 							configDirs: cCtx.StringSlice("config-directory"),

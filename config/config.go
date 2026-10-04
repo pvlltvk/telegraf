@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -66,12 +67,19 @@ var (
 	Password Secret
 
 	// telegrafVersion contains the parsed semantic Telegraf version
-	telegrafVersion *semver.Version = semver.New("0.0.0-unknown")
+	telegrafVersion = currentVersion()
 
 	// List of (redacted) configuration Sources
 	sources   []string
 	sourcesMu sync.Mutex
 )
+
+func currentVersion() *semver.Version {
+	if internal.Version == "" || internal.Version == "unknown" {
+		return semver.New("0.0.0-unknown")
+	}
+	return semver.New(internal.Version)
+}
 
 const EmptySourcePath string = ""
 
@@ -114,6 +122,7 @@ type Config struct {
 
 	NumberSecrets uint64
 
+	validationOnly     bool
 	seenAgentTable     bool
 	seenAgentTableOnce sync.Once
 }
@@ -133,6 +142,10 @@ func (op OrderedPlugins) Less(i, j int) bool { return op[i].Line < op[j].Line }
 // For historical reasons, It holds the actual instances of the running plugins
 // once the configuration is parsed.
 func NewConfig() *Config {
+	return createConfig(true)
+}
+
+func createConfig(resetSources bool) *Config {
 	c := &Config{
 		UnusedFields:      make(map[string]bool),
 		unusedFieldsMutex: &sync.Mutex{},
@@ -160,11 +173,6 @@ func NewConfig() *Config {
 		Deprecations:       make(map[string][]int64),
 	}
 
-	// Handle unknown version
-	if internal.Version != "" && internal.Version != "unknown" {
-		telegrafVersion = semver.New(internal.Version)
-	}
-
 	tomlCfg := &toml.Config{
 		NormFieldName: toml.DefaultConfig.NormFieldName,
 		FieldToKey:    toml.DefaultConfig.FieldToKey,
@@ -173,9 +181,11 @@ func NewConfig() *Config {
 	c.toml = tomlCfg
 
 	// Initialize the configuration source list
-	sourcesMu.Lock()
-	sources = make([]string, 0)
-	sourcesMu.Unlock()
+	if resetSources {
+		sourcesMu.Lock()
+		sources = make([]string, 0)
+		sourcesMu.Unlock()
+	}
 
 	return c
 }
@@ -552,16 +562,21 @@ func isURL(str string) bool {
 
 // LoadConfig loads the given config files and applies it to c
 func (c *Config) LoadConfig(path string) error {
+	return c.readConfig(context.Background(), 30*time.Second, path)
+}
+
+func (c *Config) readConfig(ctx context.Context, timeout time.Duration, path string) error {
 	if !c.Agent.Quiet {
 		log.Printf("I! Loading config: %s", path)
 	}
 
-	data, _, err := LoadConfigFileWithRetries(path, c.Agent.ConfigURLRetryAttempts)
+	file, err := readConfigFile(ctx, path, c.Agent.ConfigURLRetryAttempts, timeout)
 	if err != nil {
 		return fmt.Errorf("loading config file %s failed: %w", path, err)
 	}
 
-	if err = c.LoadConfigData(data, path); err != nil {
+	publishSource(path)
+	if err = c.LoadConfigData(file.data, path); err != nil {
 		return fmt.Errorf("loading config file %s failed: %w", path, err)
 	}
 
@@ -569,12 +584,20 @@ func (c *Config) LoadConfig(path string) error {
 }
 
 func (c *Config) LoadAll(configFiles ...string) error {
+	return c.LoadAllContext(context.Background(), 30*time.Second, configFiles...)
+}
+
+func (c *Config) LoadAllContext(ctx context.Context, timeout time.Duration, configFiles ...string) error {
 	for _, fConfig := range configFiles {
-		if err := c.LoadConfig(fConfig); err != nil {
+		if err := c.readConfig(ctx, timeout, fConfig); err != nil {
 			return err
 		}
 	}
 
+	return c.finishLoading()
+}
+
+func (c *Config) finishLoading() error {
 	if c.Agent.SkipProcessorsBeforeAggregators && c.Agent.SkipProcessorsAfterAggregators != nil && *c.Agent.SkipProcessorsAfterAggregators {
 		return errors.New("cannot set both skip_processors_before_aggregators and skip_processors_after_aggregators as true")
 	}
@@ -591,6 +614,10 @@ func (c *Config) LoadAll(configFiles ...string) error {
 	// Set snmp agent translator default
 	if c.Agent.SnmpTranslator == "" {
 		c.Agent.SnmpTranslator = "netsnmp"
+	}
+
+	if c.validationOnly {
+		return nil
 	}
 
 	// Check if there is enough lockable memory for the secret
@@ -624,6 +651,11 @@ func (c *Config) LoadConfigData(data []byte, path string) error {
 		return fmt.Errorf("error parsing data: %w", err)
 	}
 
+	return c.loadConfigTable(tbl, path)
+}
+
+func (c *Config) loadConfigTable(tbl *ast.Table, path string) error {
+	var err error
 	// Parse tags tables first:
 	for _, tableName := range []string{"tags", "global_tags"} {
 		if val, ok := tbl.Fields[tableName]; ok {
@@ -631,7 +663,7 @@ func (c *Config) LoadConfigData(data []byte, path string) error {
 			if !ok {
 				return fmt.Errorf("invalid configuration, bad table name %q", tableName)
 			}
-			if err = c.toml.UnmarshalTable(subTable, c.Tags); err != nil {
+			if err = c.unmarshalTable(subTable, c.Tags); err != nil {
 				return fmt.Errorf("error parsing table name %q: %w", tableName, err)
 			}
 		}
@@ -650,7 +682,7 @@ func (c *Config) LoadConfigData(data []byte, path string) error {
 		if !ok {
 			return errors.New("invalid configuration, error parsing agent table")
 		}
-		if err = c.toml.UnmarshalTable(subTable, c.Agent); err != nil {
+		if err = c.unmarshalTable(subTable, c.Agent); err != nil {
 			return fmt.Errorf("error parsing [agent]: %w", err)
 		}
 		if c.Agent.CollectionOffset < 0 {
@@ -858,43 +890,55 @@ func LoadConfigFile(config string) ([]byte, bool, error) {
 	return LoadConfigFileWithRetries(config, 0)
 }
 
-func LoadConfigFileWithRetries(config string, urlRetryAttempts int) ([]byte, bool, error) {
-	if fetchURLRe.MatchString(config) {
-		u, err := url.Parse(config)
-		if err != nil {
-			return nil, true, err
-		}
-
-		switch u.Scheme {
-		case "https", "http":
-			data, err := fetchConfig(u, urlRetryAttempts)
-			if err != nil {
-				return nil, true, err
-			}
-			sourcesMu.Lock()
-			sources = append(sources, u.Redacted())
-			sourcesMu.Unlock()
-			return data, true, nil
-		default:
-			return nil, true, fmt.Errorf("scheme %q not supported", u.Scheme)
-		}
+func LoadConfigFileWithRetries(path string, urlRetryAttempts int) ([]byte, bool, error) {
+	file, err := readConfigFile(context.Background(), path, urlRetryAttempts, 30*time.Second)
+	if err == nil {
+		publishSource(path)
 	}
+	return file.data, file.remote, err
+}
 
-	// If it isn't a https scheme, try it as a file
-	buffer, err := os.ReadFile(config)
-	if err != nil {
-		return nil, false, err
+func publishSource(path string) {
+	if u, err := url.Parse(path); err == nil && fetchURLRe.MatchString(path) {
+		path = u.Redacted()
 	}
 	sourcesMu.Lock()
-	sources = append(sources, config)
+	sources = append(sources, path)
 	sourcesMu.Unlock()
+}
 
-	mimeType := http.DetectContentType(buffer)
-	if !strings.Contains(mimeType, "text/plain") {
-		return nil, false, fmt.Errorf("provided config is not a TOML file: %s", config)
+type configFile struct {
+	data         []byte
+	remote       bool
+	lastModified string
+}
+
+func readConfigFile(ctx context.Context, path string, retries int, timeout time.Duration) (configFile, error) {
+	if fetchURLRe.MatchString(path) {
+		file := configFile{remote: true}
+		u, err := url.Parse(path)
+		if err != nil {
+			return file, err
+		}
+		switch u.Scheme {
+		case "https", "http":
+			file.data, file.lastModified, err = fetchConfigContext(ctx, u, retries, timeout)
+			return file, err
+		default:
+			return file, fmt.Errorf("scheme %q not supported", u.Scheme)
+		}
 	}
-
-	return buffer, false, nil
+	if err := ctx.Err(); err != nil {
+		return configFile{}, err
+	}
+	buffer, err := os.ReadFile(path)
+	if err != nil {
+		return configFile{}, err
+	}
+	if !strings.Contains(http.DetectContentType(buffer), "text/plain") {
+		return configFile{}, fmt.Errorf("provided config is not a TOML file: %s", path)
+	}
+	return configFile{data: buffer}, nil
 }
 
 // GetSources returns the redacted list of configuration sources
@@ -904,12 +948,11 @@ func GetSources() []string {
 	return slices.Clone(sources)
 }
 
-func fetchConfig(u *url.URL, urlRetryAttempts int) ([]byte, error) {
+func fetchConfigContext(ctx context.Context, u *url.URL, urlRetryAttempts int, timeout time.Duration) ([]byte, string, error) {
 	req, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-
 	if v, exists := os.LookupEnv("TELEGRAF_CONTROLLER_TOKEN"); exists {
 		req.Header.Add("Authorization", "Bearer "+v)
 	} else if v, exists := os.LookupEnv("INFLUX_TOKEN"); exists {
@@ -917,53 +960,64 @@ func fetchConfig(u *url.URL, urlRetryAttempts int) ([]byte, error) {
 	}
 	req.Header.Add("Accept", "application/toml")
 	req.Header.Set("User-Agent", internal.ProductToken())
-
 	var totalAttempts int
-	if urlRetryAttempts == -1 {
+	switch {
+	case urlRetryAttempts == -1:
 		totalAttempts = -1
 		log.Printf("Using unlimited number of attempts to fetch HTTP config")
-	} else if urlRetryAttempts == 0 {
+	case urlRetryAttempts == 0:
 		totalAttempts = 3
-	} else if urlRetryAttempts > 0 {
+	case urlRetryAttempts > 0:
 		totalAttempts = urlRetryAttempts
-	} else {
-		return nil, fmt.Errorf("invalid number of attempts: %d", urlRetryAttempts)
+	default:
+		return nil, "", fmt.Errorf("invalid number of attempts: %d", urlRetryAttempts)
 	}
-
-	attempt := 0
-	for {
-		body, err := requestURLConfig(req)
+	for attempt := 0; ; attempt++ {
+		requestCtx, cancel := context.WithTimeout(ctx, timeout)
+		body, modified, err := requestURLConfigMetadata(req.WithContext(requestCtx))
+		cancel()
 		if err == nil {
-			return body, nil
+			return body, modified, nil
 		}
-
+		if ctx.Err() != nil {
+			return nil, "", ctx.Err()
+		}
 		log.Printf("Error getting HTTP config (attempt %d of %d): %s", attempt, totalAttempts, err)
-		if urlRetryAttempts != -1 && attempt >= totalAttempts {
-			return nil, err
+		if totalAttempts != -1 && attempt >= totalAttempts {
+			return nil, "", err
 		}
-
-		time.Sleep(httpLoadConfigRetryInterval)
-		attempt++
+		timer := time.NewTimer(httpLoadConfigRetryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, "", ctx.Err()
+		case <-timer.C:
+		}
 	}
 }
 
 func requestURLConfig(req *http.Request) ([]byte, error) {
+	data, _, err := requestURLConfigMetadata(req)
+	return data, err
+}
+
+func requestURLConfigMetadata(req *http.Request) ([]byte, string, error) {
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to HTTP config server: %w", err)
+		return nil, "", fmt.Errorf("failed to connect to HTTP config server: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to fetch HTTP config: %s", resp.Status)
+		return nil, "", fmt.Errorf("failed to fetch HTTP config: %s", resp.Status)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, "", fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	return body, nil
+	return body, resp.Header.Get("Last-Modified"), nil
 }
 
 // parseConfig loads a TOML configuration from a provided path and
@@ -1015,7 +1069,7 @@ func (c *Config) addAggregator(name, source string, table *ast.Table) error {
 		return err
 	}
 
-	if err := c.toml.UnmarshalTable(table, aggregator); err != nil {
+	if err := c.unmarshalTable(table, aggregator); err != nil {
 		return err
 	}
 
@@ -1023,7 +1077,11 @@ func (c *Config) addAggregator(name, source string, table *ast.Table) error {
 		return err
 	}
 
-	c.Aggregators = append(c.Aggregators, models.NewRunningAggregator(aggregator, conf))
+	if c.validationOnly {
+		c.Aggregators = append(c.Aggregators, &models.RunningAggregator{Aggregator: aggregator, Config: conf})
+	} else {
+		c.Aggregators = append(c.Aggregators, models.NewRunningAggregator(aggregator, conf))
+	}
 	return nil
 }
 
@@ -1064,7 +1122,7 @@ func (c *Config) addSecretStore(name, source string, table *ast.Table) error {
 	}
 	store := creator(storeID)
 
-	if err := c.toml.UnmarshalTable(table, store); err != nil {
+	if err := c.unmarshalTable(table, store); err != nil {
 		return err
 	}
 
@@ -1072,12 +1130,14 @@ func (c *Config) addSecretStore(name, source string, table *ast.Table) error {
 		return err
 	}
 
-	logger := logging.New("secretstores", name, "")
-	models.SetLoggerOnPlugin(store, logger)
-	models.SetStatisticsOnPlugin(store, logger, tags)
+	if !c.validationOnly {
+		logger := logging.New("secretstores", name, "")
+		models.SetLoggerOnPlugin(store, logger)
+		models.SetStatisticsOnPlugin(store, logger, tags)
 
-	if err := store.Init(); err != nil {
-		return fmt.Errorf("error initializing secret store %q: %w", storeID, err)
+		if err := store.Init(); err != nil {
+			return fmt.Errorf("error initializing secret store %q: %w", storeID, err)
+		}
 	}
 
 	if _, found := c.SecretStores[storeID]; found {
@@ -1119,6 +1179,8 @@ func (c *Config) probeParser(parentCategory, parentName string, table *ast.Table
 	dataFormat := c.getFieldString(table, "data_format")
 	if dataFormat == "" {
 		dataFormat = setDefaultParser(parentCategory, parentName)
+	} else if c.validationOnly && dataFormat == "influx" && c.getFieldString(table, "influx_parser_type") == "upstream" {
+		dataFormat = "influx_upstream"
 	}
 
 	creator, ok := parsers.Parsers[dataFormat]
@@ -1128,8 +1190,9 @@ func (c *Config) probeParser(parentCategory, parentName string, table *ast.Table
 
 	// Try to parse the options to detect if any of them is misspelled
 	parser := creator("")
-	//nolint:errcheck // We don't actually use the parser, so no need to check the error.
-	c.toml.UnmarshalTable(table, parser)
+	if err := c.unmarshalTable(table, parser); err != nil && c.validationOnly {
+		c.addError(table, err)
+	}
 
 	return true
 }
@@ -1164,10 +1227,13 @@ func (c *Config) addParser(parentcategory, parentname string, table *ast.Table) 
 		}
 	}
 
-	if err := c.toml.UnmarshalTable(table, parser); err != nil {
+	if err := c.unmarshalTable(table, parser); err != nil {
 		return nil, err
 	}
 
+	if c.validationOnly {
+		return &models.RunningParser{Parser: parser, Config: conf}, nil
+	}
 	running := models.NewRunningParser(parser, conf)
 	err := running.Init()
 	return running, err
@@ -1186,8 +1252,9 @@ func (c *Config) probeSerializer(table *ast.Table) bool {
 
 	// Try to parse the options to detect if any of them is misspelled
 	serializer := creator()
-	//nolint:errcheck // We don't actually use the parser, so no need to check the error.
-	c.toml.UnmarshalTable(table, serializer)
+	if err := c.unmarshalTable(table, serializer); err != nil && c.validationOnly {
+		c.addError(table, err)
+	}
 
 	return true
 }
@@ -1208,10 +1275,13 @@ func (c *Config) addSerializer(parentname string, table *ast.Table) (*models.Run
 	}
 	serializer := creator()
 
-	if err := c.toml.UnmarshalTable(table, serializer); err != nil {
+	if err := c.unmarshalTable(table, serializer); err != nil {
 		return nil, err
 	}
 
+	if c.validationOnly {
+		return &models.RunningSerializer{Serializer: serializer, Config: conf}, nil
+	}
 	running := models.NewRunningSerializer(serializer, conf)
 	err := running.Init()
 	return running, err
@@ -1255,7 +1325,10 @@ func (c *Config) addProcessor(name, source string, table *ast.Table) error {
 	if err != nil {
 		return err
 	}
-	rf := models.NewRunningProcessor(processorBefore, processorBeforeConfig)
+	rf := &models.RunningProcessor{Processor: processorBefore, Config: processorBeforeConfig}
+	if !c.validationOnly {
+		rf = models.NewRunningProcessor(processorBefore, processorBeforeConfig)
+	}
 	c.fileProcessors = append(c.fileProcessors, &OrderedPlugin{table.Line, rf})
 
 	// Setup another (new) processor instance running after the aggregator
@@ -1267,7 +1340,10 @@ func (c *Config) addProcessor(name, source string, table *ast.Table) error {
 	if err != nil {
 		return err
 	}
-	rf = models.NewRunningProcessor(processorAfter, processorAfterConfig)
+	rf = &models.RunningProcessor{Processor: processorAfter, Config: processorAfterConfig}
+	if !c.validationOnly {
+		rf = models.NewRunningProcessor(processorAfter, processorAfterConfig)
+	}
 	c.fileAggProcessors = append(c.fileAggProcessors, &OrderedPlugin{table.Line, rf})
 
 	// Check the number of misses against the threshold. We need to double
@@ -1339,7 +1415,7 @@ func (c *Config) setupProcessor(name string, creator processors.StreamingCreator
 		optionTestCount++
 	}
 
-	if err := c.toml.UnmarshalTable(table, processor); err != nil {
+	if err := c.unmarshalTable(table, processor); err != nil {
 		return nil, 0, fmt.Errorf("unmarshalling failed: %w", err)
 	}
 
@@ -1408,7 +1484,7 @@ func (c *Config) addOutput(name, source string, table *ast.Table) error {
 		return err
 	}
 
-	if err := c.toml.UnmarshalTable(table, output); err != nil {
+	if err := c.unmarshalTable(table, output); err != nil {
 		return err
 	}
 
@@ -1416,8 +1492,8 @@ func (c *Config) addOutput(name, source string, table *ast.Table) error {
 		return err
 	}
 
-	if c, ok := any(output).(interface{ TLSConfig() (*tls.Config, error) }); ok {
-		if _, err := c.TLSConfig(); err != nil {
+	if p, ok := any(output).(interface{ TLSConfig() (*tls.Config, error) }); ok && !c.validationOnly {
+		if _, err := p.TLSConfig(); err != nil {
 			return err
 		}
 	}
@@ -1432,6 +1508,10 @@ func (c *Config) addOutput(name, source string, table *ast.Table) error {
 		}
 	}
 
+	if c.validationOnly {
+		c.Outputs = append(c.Outputs, &models.RunningOutput{Output: output, Config: outputConfig})
+		return nil
+	}
 	ro, err := models.NewRunningOutput(output, outputConfig, c.Agent.MetricBatchSize, c.Agent.MetricBufferLimit)
 	if err != nil {
 		return err
@@ -1503,7 +1583,7 @@ func (c *Config) addInput(name, source string, table *ast.Table) error {
 		return err
 	}
 
-	if err := c.toml.UnmarshalTable(table, input); err != nil {
+	if err := c.unmarshalTable(table, input); err != nil {
 		return err
 	}
 
@@ -1511,8 +1591,8 @@ func (c *Config) addInput(name, source string, table *ast.Table) error {
 		return err
 	}
 
-	if c, ok := any(input).(interface{ TLSConfig() (*tls.Config, error) }); ok {
-		if _, err := c.TLSConfig(); err != nil {
+	if p, ok := any(input).(interface{ TLSConfig() (*tls.Config, error) }); ok && !c.validationOnly {
+		if _, err := p.TLSConfig(); err != nil {
 			return err
 		}
 	}
@@ -1527,6 +1607,10 @@ func (c *Config) addInput(name, source string, table *ast.Table) error {
 		}
 	}
 
+	if c.validationOnly {
+		c.Inputs = append(c.Inputs, &models.RunningInput{Input: input, Config: pluginConfig})
+		return nil
+	}
 	rp := models.NewRunningInput(input, pluginConfig)
 	rp.SetDefaultTags(c.Tags)
 	c.Inputs = append(c.Inputs, rp)
@@ -1566,7 +1650,7 @@ func (c *Config) buildAggregator(name, source string, tbl *ast.Table) (*models.A
 	conf.Tags = make(map[string]string)
 	if node, ok := tbl.Fields["tags"]; ok {
 		if subtbl, ok := node.(*ast.Table); ok {
-			if err := c.toml.UnmarshalTable(subtbl, conf.Tags); err != nil {
+			if err := c.unmarshalTable(subtbl, conf.Tags); err != nil {
 				return nil, fmt.Errorf("could not parse tags for input %s", name)
 			}
 		}
@@ -1725,7 +1809,7 @@ func (c *Config) buildInput(name, source string, tbl *ast.Table) (*models.InputC
 	cp.Tags = make(map[string]string)
 	if node, ok := tbl.Fields["tags"]; ok {
 		if subtbl, ok := node.(*ast.Table); ok {
-			if err := c.toml.UnmarshalTable(subtbl, cp.Tags); err != nil {
+			if err := c.unmarshalTable(subtbl, cp.Tags); err != nil {
 				return nil, fmt.Errorf("could not parse tags for input %s", name)
 			}
 		}
@@ -1870,12 +1954,15 @@ func (c *Config) resetMissingTomlFieldTracker() {
 	c.toml.MissingField = c.missingTomlField
 }
 
-func (*Config) getFieldString(tbl *ast.Table, fieldName string) string {
+func (c *Config) getFieldString(tbl *ast.Table, fieldName string) string {
 	if node, ok := tbl.Fields[fieldName]; ok {
 		if kv, ok := node.(*ast.KeyValue); ok {
 			if str, ok := kv.Value.(*ast.String); ok {
 				return str.Value
 			}
+		}
+		if c.validationOnly {
+			c.addError(tbl, fmt.Errorf("found unexpected format while parsing %q, expecting string", fieldName))
 		}
 	}
 
@@ -1893,6 +1980,9 @@ func (c *Config) getFieldDuration(tbl *ast.Table, fieldName string) (time.Durati
 				}
 				return d, true
 			}
+		}
+		if c.validationOnly {
+			c.addError(tbl, fmt.Errorf("found unexpected format while parsing %q, expecting a duration string", fieldName))
 		}
 	}
 
@@ -1939,6 +2029,9 @@ func (c *Config) getFieldInt(tbl *ast.Table, fieldName string) int {
 				return int(i)
 			}
 		}
+		if c.validationOnly {
+			c.addError(tbl, fmt.Errorf("found unexpected format while parsing %q, expecting int", fieldName))
+		}
 	}
 
 	return 0
@@ -1975,6 +2068,8 @@ func (c *Config) getFieldStringSlice(tbl *ast.Table, fieldName string) []string 
 			for _, elem := range ary.Value {
 				if str, ok := elem.(*ast.String); ok {
 					target = append(target, str.Value)
+				} else if c.validationOnly {
+					c.addError(tbl, fmt.Errorf("found unexpected format while parsing %q, expecting string array/slice format", fieldName))
 				}
 			}
 		}

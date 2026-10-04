@@ -41,12 +41,13 @@ func (t *Telegraf) Run() error {
 		switch t.service {
 		case "install":
 			cfg := &serviceConfig{
-				displayName:  t.serviceDisplayName,
-				restartDelay: t.serviceRestartDelay,
-				autoRestart:  t.serviceAutoRestart,
-				configs:      t.config,
-				configDirs:   t.configDir,
-				watchConfig:  t.watchConfig,
+				displayName:      t.serviceDisplayName,
+				restartDelay:     t.serviceRestartDelay,
+				autoRestart:      t.serviceAutoRestart,
+				configs:          t.config,
+				configDirs:       t.configDir,
+				watchConfig:      t.watchConfig,
+				configURLTimeout: t.configURLTimeout,
 			}
 			if err := installService(t.serviceName, cfg); err != nil {
 				return err
@@ -88,13 +89,6 @@ func (t *Telegraf) Run() error {
 		return svc.Run(t.serviceName, t)
 	}
 
-	// Load the configuration file(s)
-	cfg, err := t.loadConfiguration()
-	if err != nil {
-		return err
-	}
-	t.cfg = cfg
-
 	stop = make(chan struct{})
 	defer close(stop)
 	return t.reloadLoop()
@@ -119,34 +113,25 @@ func (t *Telegraf) Execute(_ []string, r <-chan svc.ChangeRequest, changes chan<
 	//nolint:errcheck // We have no way to route the error to the user so ignore it
 	svclog.Info(eventID, fmt.Sprintf("Starting Telegraf %s...", internal.Version))
 
-	// Load the configuration file(s)
-	cfg, err := t.loadConfiguration()
-	if err != nil {
-		//nolint:errcheck // We have no way to route the error to the user so ignore it
-		svclog.Error(eventID, err.Error())
-		return true, 2
-	}
-	t.cfg = cfg
-
-	//nolint:errcheck // We have no way to route the error to the user so ignore it
-	svclog.Info(eventID, "Finished loading configurations, starting data collection...")
-
 	// Actually start the processing loop in the background to be able to
 	// react to service change requests
 	loopErr := make(chan error)
+	ready := make(chan struct{}, 1)
+	t.ready = ready
+	var readySignal <-chan struct{} = ready
 	stop = make(chan struct{})
 	defer close(loopErr)
 	defer close(stop)
 	go func() {
 		loopErr <- t.reloadLoop()
 	}()
-	changes <- svc.Status{State: svc.Running, Accepts: accepted}
-
-	//nolint:errcheck // We have no way to route the error to the user so ignore it
-	svclog.Info(eventID, "Telegraf is running...")
-
 	for {
 		select {
+		case <-readySignal:
+			readySignal = nil
+			changes <- svc.Status{State: svc.Running, Accepts: accepted}
+			//nolint:errcheck // We have no way to route the error to the user so ignore it
+			svclog.Info(eventID, "Telegraf is running...")
 		case err := <-loopErr:
 			if err != nil {
 				log.Printf("E! %s", err)
@@ -165,6 +150,7 @@ func (t *Telegraf) Execute(_ []string, r <-chan svc.ChangeRequest, changes chan<
 				time.Sleep(100 * time.Millisecond)
 				changes <- c.CurrentStatus
 			case svc.Stop, svc.Shutdown:
+				readySignal = nil
 				changes <- svc.Status{State: svc.StopPending}
 				var empty struct{}
 				stop <- empty // signal reloadLoop to finish (context cancel)
@@ -185,9 +171,10 @@ type serviceConfig struct {
 	autoRestart  bool
 
 	// Telegraf parameters
-	configs     []string
-	configDirs  []string
-	watchConfig string
+	configs          []string
+	configDirs       []string
+	watchConfig      string
+	configURLTimeout time.Duration
 }
 
 func installService(name string, cfg *serviceConfig) error {
@@ -216,6 +203,9 @@ func installService(name string, cfg *serviceConfig) error {
 	}
 	if cfg.watchConfig != "" {
 		args = append(args, "--watch-config", cfg.watchConfig)
+	}
+	if cfg.configURLTimeout > 0 {
+		args = append(args, "--config-url-timeout", cfg.configURLTimeout.String())
 	}
 	// Pass the service name to the command line, to have a custom name when relaunching as a service
 	args = append(args, "--service-name", name)

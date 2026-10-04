@@ -52,6 +52,37 @@ On most systems, the default locations are `/etc/telegraf/telegraf.conf` for
 the main configuration file and `/etc/telegraf/telegraf.d` for the directory of
 configuration files.
 
+### Configuration Reloading
+
+Send `SIGHUP` to reload the configuration on systems that support it. Use
+`--watch-config notify` or `--watch-config poll` to reload when local files or
+configuration directories change. For URL-based configurations, use
+`--config-url-watch-interval` to check for changes to the `Last-Modified` header.
+
+Telegraf fetches and validates the complete replacement before stopping the
+running agent. If fetching or validation fails, it logs the rejection and
+continues collecting with the existing configuration. This includes malformed
+TOML, unknown plugin names or options, and plugins not compiled into the binary.
+Later changes can trigger another reload.
+
+A valid replacement is applied using the same configuration content that was
+validated. Applying it stops and restarts collection, which can cause a brief
+gap. Errors while applying the replacement remain fatal, including failures to
+open buffers or log files, load TLS credentials, resolve secrets, or initialize
+and start plugins. Telegraf does not restore the previous configuration.
+Initial startup errors also remain fatal. No configuration is cached on disk
+for offline startup.
+
+`--config-url-timeout` bounds each configuration GET or HEAD request, including
+reading the response body. It defaults to `30s` and must be positive. Requests
+and retry waits are canceled when Telegraf shuts down. Existing
+`--config-url-retry-attempts` behavior remains supported, including `-1` for
+unlimited retries.
+
+Remote watcher errors leave the running configuration in place. A URL without
+a `Last-Modified` header cannot be watched automatically; Telegraf warns once
+and disables automatic checks for that URL. Manual reload remains available.
+
 ## Environment Variables
 
 Environment variables can be used anywhere in the config file, simply surround

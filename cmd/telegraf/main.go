@@ -8,6 +8,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/awnumar/memguard"
 	"github.com/fatih/color"
@@ -236,6 +237,9 @@ func runApp(args []string, outputBuffer io.Writer, pprof Server, c TelegrafConfi
 		if cCtx.Bool("strict-env-handling") && cCtx.Bool("non-strict-env-handling") {
 			return errors.New("flags --strict-env-handling and --non-strict-env-handling cannot be used together")
 		}
+		if cCtx.Duration("config-url-timeout") <= 0 {
+			return errors.New("config-url-timeout must be positive")
+		}
 		if !cCtx.Bool("strict-env-handling") && !cCtx.Bool("non-strict-env-handling") {
 			msg := "Strict environment variable handling is the new default starting with v1.38.0! " +
 				"If your configuration does not work with strict handling please explicitly add " +
@@ -254,6 +258,7 @@ func runApp(args []string, outputBuffer io.Writer, pprof Server, c TelegrafConfi
 			configDir:               cCtx.StringSlice("config-directory"),
 			testWait:                cCtx.Int("test-wait"),
 			configURLRetryAttempts:  cCtx.Int("config-url-retry-attempts"),
+			configURLTimeout:        cCtx.Duration("config-url-timeout"),
 			configURLWatchInterval:  cCtx.Duration("config-url-watch-interval"),
 			watchConfig:             cCtx.String("watch-config"),
 			watchInterval:           cCtx.Duration("watch-interval"),
@@ -383,6 +388,11 @@ func runApp(args []string, outputBuffer io.Writer, pprof Server, c TelegrafConfi
 					Usage: "Time duration to check for updates to config files specified by --config and " +
 						"--config-directory options. Use with '--watch-config poll'",
 					DefaultText: "disabled",
+				},
+				&cli.DurationFlag{
+					Name:  "config-url-timeout",
+					Usage: "Timeout for each configuration URL request, including reading the response body",
+					Value: 30 * time.Second,
 				},
 				&cli.DurationFlag{
 					Name:        "config-url-watch-interval",
