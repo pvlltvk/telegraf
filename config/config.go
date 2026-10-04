@@ -996,11 +996,6 @@ func fetchConfigContext(ctx context.Context, u *url.URL, urlRetryAttempts int, t
 	}
 }
 
-func requestURLConfig(req *http.Request) ([]byte, error) {
-	data, _, err := requestURLConfigMetadata(req)
-	return data, err
-}
-
 func requestURLConfigMetadata(req *http.Request) ([]byte, string, error) {
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

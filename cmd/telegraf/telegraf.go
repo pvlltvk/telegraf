@@ -215,13 +215,25 @@ func (t *Telegraf) reloadLoop() error {
 	}
 
 	var stopWatching context.CancelFunc
+	var stopRemoteWatching context.CancelFunc
+	startRemoteWatching := func() {
+		if stopRemoteWatching != nil {
+			stopRemoteWatching()
+		}
+		if t.configURLWatchInterval > 0 && len(baselines) > 0 {
+			watchCtx, stop := context.WithCancel(ctx)
+			stopRemoteWatching = stop
+			acceptedBaselines := baselines
+			workers.Go(func() { t.watchRemoteConfigs(watchCtx, reload, t.configURLWatchInterval, acceptedBaselines) })
+		}
+	}
 	startWatching := func() {
 		if stopWatching != nil {
 			stopWatching()
 		}
-		watchCtx, stop := context.WithCancel(ctx)
-		stopWatching = stop
 		if t.watchConfig != "" {
+			watchCtx, stop := context.WithCancel(ctx)
+			stopWatching = stop
 			for _, path := range append(append(make([]string, 0, len(t.configFiles)+len(t.configDir)), t.configFiles...), t.configDir...) {
 				if isURL(path) {
 					continue
@@ -233,12 +245,12 @@ func (t *Telegraf) reloadLoop() error {
 				workers.Go(func() { t.watchLocalConfig(watchCtx, reload, path) })
 			}
 		}
-		if t.configURLWatchInterval > 0 && len(baselines) > 0 {
-			acceptedBaselines := baselines
-			workers.Go(func() { t.watchRemoteConfigs(watchCtx, reload, t.configURLWatchInterval, acceptedBaselines) })
-		}
+		startRemoteWatching()
 	}
 	defer func() {
+		if stopRemoteWatching != nil {
+			stopRemoteWatching()
+		}
 		if stopWatching != nil {
 			stopWatching()
 		}
@@ -256,6 +268,10 @@ func (t *Telegraf) reloadLoop() error {
 	var staging <-chan stagedConfiguration
 	var stopStaging context.CancelFunc
 	for {
+		reloadCh := reload
+		if staging != nil {
+			reloadCh = nil
+		}
 		select {
 		case <-ctx.Done():
 			stopAgent()
@@ -277,12 +293,7 @@ func (t *Telegraf) reloadLoop() error {
 				return fmt.Errorf("[telegraf] Error running agent: %w", err)
 			}
 			return nil
-		case <-func() <-chan struct{} {
-			if staging == nil {
-				return reload
-			}
-			return nil
-		}():
+		case <-reloadCh:
 			log.Println("I! Loading replacement Telegraf config")
 			stageCtx, stop := context.WithCancel(ctx)
 			stopStaging = stop
@@ -297,6 +308,7 @@ func (t *Telegraf) reloadLoop() error {
 			}
 			if staged.err != nil {
 				log.Printf("E! [telegraf] Config reload rejected: %v", staged.err)
+				startRemoteWatching()
 				continue
 			}
 			stopAgent()
@@ -502,6 +514,7 @@ func (t *Telegraf) watchRemoteConfigs(ctx context.Context, reload chan<- struct{
 					log.Printf("W! Last-Modified header not found, disabling automatic watching for %s", path)
 					delete(lastModified, path)
 				} else if modified != baseline {
+					lastModified[path] = modified
 					requestReload(reload)
 				}
 			}

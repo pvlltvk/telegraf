@@ -192,11 +192,9 @@ func TestRemoteWatcherRejectsHTTPErrorAndPreservesBaseline(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("changed config did not trigger reload")
 	}
-	select {
-	case <-reload:
-	case <-time.After(time.Second):
-		t.Fatal("unaccepted baseline stopped triggering reload")
-	}
+	before := calls.Load()
+	require.Eventually(t, func() bool { return calls.Load() >= before+3 }, time.Second, 5*time.Millisecond)
+	require.Empty(t, reload, "same Last-Modified value must not trigger a second reload")
 	cancel()
 	<-done
 }
@@ -212,6 +210,110 @@ func TestRemoteWatcherMissingLastModifiedDisablesSource(t *testing.T) {
 	require.EqualValues(t, 1, calls.Load())
 	agent.watchRemoteConfigs(ctx, make(chan struct{}, 1), time.Second, map[string]string{server.URL: ""})
 	require.EqualValues(t, 1, calls.Load())
+}
+
+func TestRemoteWatcherOneChangeOneReload(t *testing.T) {
+	var modified atomic.Value
+	modified.Store("v1")
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Last-Modified", modified.Load().(string))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reload := make(chan struct{}, 4)
+	done := make(chan struct{})
+	agent := &Telegraf{}
+	go func() {
+		agent.watchRemoteConfigs(ctx, reload, 5*time.Millisecond, map[string]string{server.URL: "v1"})
+		close(done)
+	}()
+
+	require.Eventually(t, func() bool { return calls.Load() >= 3 }, time.Second, 5*time.Millisecond)
+	require.Empty(t, reload)
+
+	modified.Store("v2")
+	select {
+	case <-reload:
+	case <-time.After(time.Second):
+		t.Fatal("first change did not trigger reload")
+	}
+	before := calls.Load()
+	require.Eventually(t, func() bool { return calls.Load() >= before+3 }, time.Second, 5*time.Millisecond)
+	require.Empty(t, reload, "first change must not trigger more than one reload")
+
+	modified.Store("v3")
+	select {
+	case <-reload:
+	case <-time.After(time.Second):
+		t.Fatal("second change did not trigger reload")
+	}
+	before = calls.Load()
+	require.Eventually(t, func() bool { return calls.Load() >= before+3 }, time.Second, 5*time.Millisecond)
+	require.Empty(t, reload, "second change must not trigger more than one reload")
+
+	cancel()
+	<-done
+}
+
+func TestRemoteReloadRetriesAfterRejectionAndActivatesOnce(t *testing.T) {
+	counters := reloadPlugins(t)
+	var lastMod atomic.Value
+	lastMod.Store("v1")
+	var body atomic.Value
+	body.Store(reloadConfig("original"))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Last-Modified", lastMod.Load().(string))
+		if r.Method == http.MethodHead {
+			return
+		}
+		_, _ = fmt.Fprint(w, body.Load().(string))
+	}))
+	defer server.Close()
+
+	agent := &Telegraf{GlobalFlags: GlobalFlags{
+		config:                 []string{server.URL},
+		configURLWatchInterval: 5 * time.Millisecond,
+		quiet:                  true,
+	}}
+	startReloadLoop(t, agent)
+	require.Eventually(t, func() bool { return counters.gathers.Load() >= 2 }, time.Second, 5*time.Millisecond)
+
+	// Serve invalid config at a new Last-Modified. The watcher detects
+	// the change, staging fails, and the reloadLoop restarts the watcher
+	// with the old baseline so it retries on the next interval.
+	body.Store("invalid TOML {{{\n")
+	lastMod.Store("v2")
+	before := counters.gathers.Load()
+	require.Eventually(t, func() bool { return counters.gathers.Load() >= before+5 }, time.Second, 5*time.Millisecond)
+	require.EqualValues(t, 1, counters.starts.Load())
+	require.Zero(t, counters.stops.Load())
+
+	// Fix the remote config without changing Last-Modified. The retried
+	// watcher detects the same mismatch and the valid content activates.
+	body.Store(reloadConfig("corrected"))
+	require.Eventually(t, func() bool {
+		for {
+			select {
+			case name := <-counters.names:
+				if name == "corrected" {
+					return true
+				}
+			default:
+				return false
+			}
+		}
+	}, 2*time.Second, 5*time.Millisecond)
+	require.EqualValues(t, 2, counters.starts.Load())
+	require.EqualValues(t, 1, counters.stops.Load())
+
+	before = counters.gathers.Load()
+	require.Eventually(t, func() bool { return counters.gathers.Load() >= before+5 }, time.Second, 5*time.Millisecond)
+	require.EqualValues(t, 2, counters.starts.Load())
+	require.EqualValues(t, 1, counters.stops.Load())
 }
 
 func TestReloadShutdownCancelsStagingWhileCollectionContinues(t *testing.T) {
