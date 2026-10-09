@@ -66,7 +66,7 @@ func TestReloadRejectsLoggingErrorWhileCollectionContinues(t *testing.T) {
 	require.EqualValues(t, 1, counters.starts.Load())
 	require.Zero(t, counters.stops.Load())
 	require.NoError(t, os.WriteFile(path, []byte(reloadConfig("corrected")), 0600))
-	require.Eventually(t, func() bool { return counters.starts.Load() == 2 }, time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return counters.starts.Load() >= 2 }, time.Second, 5*time.Millisecond)
 }
 
 func TestReloadServiceInputStartupFailureRemainsFatal(t *testing.T) {

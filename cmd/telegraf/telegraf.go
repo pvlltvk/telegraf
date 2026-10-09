@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -149,6 +150,16 @@ type stagedConfiguration struct {
 	err      error
 }
 
+type localWatcher struct {
+	cancel context.CancelFunc
+	done   <-chan struct{}
+}
+
+type remoteRevision struct {
+	path     string
+	modified string
+}
+
 func requestReload(reload chan<- struct{}) {
 	select {
 	case reload <- struct{}{}:
@@ -163,6 +174,7 @@ func (t *Telegraf) reloadLoop() error {
 	signal.Notify(signals, os.Interrupt, syscall.SIGHUP, syscall.SIGTERM)
 	defer signal.Stop(signals)
 	reload := make(chan struct{}, 1)
+	remoteChanges := make(chan remoteRevision)
 	var workers sync.WaitGroup
 	workers.Go(func() {
 		for {
@@ -214,7 +226,13 @@ func (t *Telegraf) reloadLoop() error {
 		}
 	}
 
-	var stopWatching context.CancelFunc
+	localWatchers := make(map[string]localWatcher)
+	stopLocalWatcher := func(path string) {
+		w := localWatchers[path]
+		w.cancel()
+		<-w.done
+		delete(localWatchers, path)
+	}
 	var stopRemoteWatching context.CancelFunc
 	startRemoteWatching := func() {
 		if stopRemoteWatching != nil {
@@ -224,16 +242,14 @@ func (t *Telegraf) reloadLoop() error {
 			watchCtx, stop := context.WithCancel(ctx)
 			stopRemoteWatching = stop
 			acceptedBaselines := baselines
-			workers.Go(func() { t.watchRemoteConfigs(watchCtx, reload, t.configURLWatchInterval, acceptedBaselines) })
+			workers.Go(func() { t.watchRemoteConfigs(watchCtx, remoteChanges, t.configURLWatchInterval, acceptedBaselines) })
 		}
 	}
+	// Watchers of unchanged paths keep running across reloads so that edits made
+	// while a replacement is activated are not missed.
 	startWatching := func() {
-		if stopWatching != nil {
-			stopWatching()
-		}
+		watched := make(map[string]bool)
 		if t.watchConfig != "" {
-			watchCtx, stop := context.WithCancel(ctx)
-			stopWatching = stop
 			for _, path := range append(append(make([]string, 0, len(t.configFiles)+len(t.configDir)), t.configFiles...), t.configDir...) {
 				if isURL(path) {
 					continue
@@ -242,7 +258,27 @@ func (t *Telegraf) reloadLoop() error {
 					log.Printf("W! Cannot watch config %s: %v", path, err)
 					continue
 				}
-				workers.Go(func() { t.watchLocalConfig(watchCtx, reload, path) })
+				watched[path] = true
+				if w, ok := localWatchers[path]; ok {
+					select {
+					case <-w.done:
+						w.cancel()
+					default:
+						continue
+					}
+				}
+				watchCtx, cancel := context.WithCancel(ctx)
+				done := make(chan struct{})
+				localWatchers[path] = localWatcher{cancel: cancel, done: done}
+				go func() {
+					defer close(done)
+					t.watchLocalConfig(watchCtx, reload, path)
+				}()
+			}
+		}
+		for path := range localWatchers {
+			if !watched[path] {
+				stopLocalWatcher(path)
 			}
 		}
 		startRemoteWatching()
@@ -251,8 +287,8 @@ func (t *Telegraf) reloadLoop() error {
 		if stopRemoteWatching != nil {
 			stopRemoteWatching()
 		}
-		if stopWatching != nil {
-			stopWatching()
+		for path := range localWatchers {
+			stopLocalWatcher(path)
 		}
 	}()
 	startWatching()
@@ -267,10 +303,20 @@ func (t *Telegraf) reloadLoop() error {
 	defer func() { stopAgent() }()
 	var staging <-chan stagedConfiguration
 	var stopStaging context.CancelFunc
+	startStaging := func() {
+		log.Println("I! Loading replacement Telegraf config")
+		stageCtx, stop := context.WithCancel(ctx)
+		stopStaging = stop
+		result := make(chan stagedConfiguration, 1)
+		staging = result
+		go func() { result <- t.stageConfiguration(stageCtx) }()
+	}
 	for {
 		reloadCh := reload
+		remoteCh := remoteChanges
 		if staging != nil {
 			reloadCh = nil
+			remoteCh = nil
 		}
 		select {
 		case <-ctx.Done():
@@ -294,12 +340,14 @@ func (t *Telegraf) reloadLoop() error {
 			}
 			return nil
 		case <-reloadCh:
-			log.Println("I! Loading replacement Telegraf config")
-			stageCtx, stop := context.WithCancel(ctx)
-			stopStaging = stop
-			result := make(chan stagedConfiguration, 1)
-			staging = result
-			go func() { result <- t.stageConfiguration(stageCtx) }()
+			startStaging()
+		case revision := <-remoteCh:
+			// A change detected while staging may already be part of the
+			// accepted snapshot; restarting for it would reload the same config.
+			if baselines[revision.path] == revision.modified {
+				continue
+			}
+			startStaging()
 		case staged := <-staging:
 			stopStaging()
 			staging = nil
@@ -331,7 +379,11 @@ func (t *Telegraf) reloadLoop() error {
 
 func (t *Telegraf) watchLocalConfig(ctx context.Context, reload chan<- struct{}, fConfig string) {
 	mytomb := new(tomb.Tomb)
-	defer func() { mytomb.Kill(nil) }()
+	waitForTeardown := func() {}
+	defer func() {
+		mytomb.Kill(nil)
+		waitForTeardown()
+	}()
 	var watcher watch.FileWatcher
 	if t.watchConfig == "poll" {
 		if t.watchInterval > 0 {
@@ -342,7 +394,28 @@ func (t *Telegraf) watchLocalConfig(ctx context.Context, reload chan<- struct{},
 	} else {
 		watcher = watch.NewInotifyFileWatcher(fConfig)
 	}
-	changes, err := watcher.ChangeEvents(mytomb, 0)
+	subscribe := func() (*watch.FileChanges, error) {
+		changes, err := watcher.ChangeEvents(mytomb, 0)
+		if err != nil {
+			return nil, err
+		}
+		// The inotify tracker shares one event channel per path and closes it
+		// when any subscription is removed, so a successor must not subscribe
+		// until the library has released this one.
+		if _, ok := watcher.(*watch.InotifyFileWatcher); ok {
+			if events := watch.Events(filepath.Clean(fConfig)); events != nil {
+				waitForTeardown = func() {
+					for {
+						if _, ok := <-events; !ok {
+							return
+						}
+					}
+				}
+			}
+		}
+		return changes, nil
+	}
+	changes, err := subscribe()
 	if err != nil {
 		log.Printf("E! Error watching config file/directory %q: %s\n", fConfig, err)
 		return
@@ -429,7 +502,7 @@ func (t *Telegraf) watchLocalConfig(ctx context.Context, reload chan<- struct{},
 				}
 				mytomb.Kill(nil)
 				mytomb = new(tomb.Tomb)
-				newChanges, err := watcher.ChangeEvents(mytomb, 0)
+				newChanges, err := subscribe()
 				if err != nil {
 					continue
 				}
@@ -464,7 +537,7 @@ func (t *Telegraf) watchLocalConfig(ctx context.Context, reload chan<- struct{},
 	}
 }
 
-func (t *Telegraf) watchRemoteConfigs(ctx context.Context, reload chan<- struct{}, interval time.Duration, baselines map[string]string) {
+func (t *Telegraf) watchRemoteConfigs(ctx context.Context, changes chan<- remoteRevision, interval time.Duration, baselines map[string]string) {
 	lastModified := make(map[string]string, len(baselines))
 	for path, modified := range baselines {
 		if modified == "" {
@@ -515,7 +588,11 @@ func (t *Telegraf) watchRemoteConfigs(ctx context.Context, reload chan<- struct{
 					delete(lastModified, path)
 				} else if modified != baseline {
 					lastModified[path] = modified
-					requestReload(reload)
+					select {
+					case changes <- remoteRevision{path: path, modified: modified}:
+					case <-ctx.Done():
+						return
+					}
 				}
 			}
 		}

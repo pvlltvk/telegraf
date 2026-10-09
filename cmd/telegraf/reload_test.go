@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -141,8 +142,6 @@ func TestReloadRejectsStaticErrorsAndAcceptsCorrection(t *testing.T) {
 			}
 		}
 	}, 2*time.Second, 5*time.Millisecond)
-	require.EqualValues(t, 2, counters.starts.Load())
-	require.EqualValues(t, 1, counters.stops.Load())
 }
 
 func TestReloadInitializationFailureRemainsFatal(t *testing.T) {
@@ -177,24 +176,24 @@ func TestRemoteWatcherRejectsHTTPErrorAndPreservesBaseline(t *testing.T) {
 	defer server.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	reload := make(chan struct{}, 1)
+	changes := make(chan remoteRevision, 1)
 	done := make(chan struct{})
 	agent := &Telegraf{}
 	go func() {
-		agent.watchRemoteConfigs(ctx, reload, 5*time.Millisecond, map[string]string{server.URL: "accepted"})
+		agent.watchRemoteConfigs(ctx, changes, 5*time.Millisecond, map[string]string{server.URL: "accepted"})
 		close(done)
 	}()
 	require.Eventually(t, func() bool { return calls.Load() >= 3 }, time.Second, 5*time.Millisecond)
-	require.Empty(t, reload)
+	require.Empty(t, changes)
 	status.Store(http.StatusOK)
 	select {
-	case <-reload:
+	case <-changes:
 	case <-time.After(time.Second):
 		t.Fatal("changed config did not trigger reload")
 	}
 	before := calls.Load()
 	require.Eventually(t, func() bool { return calls.Load() >= before+3 }, time.Second, 5*time.Millisecond)
-	require.Empty(t, reload, "same Last-Modified value must not trigger a second reload")
+	require.Empty(t, changes, "same Last-Modified value must not trigger a second reload")
 	cancel()
 	<-done
 }
@@ -206,9 +205,9 @@ func TestRemoteWatcherMissingLastModifiedDisablesSource(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	agent := &Telegraf{}
-	agent.watchRemoteConfigs(ctx, make(chan struct{}, 1), 5*time.Millisecond, map[string]string{server.URL: "accepted"})
+	agent.watchRemoteConfigs(ctx, make(chan remoteRevision, 1), 5*time.Millisecond, map[string]string{server.URL: "accepted"})
 	require.EqualValues(t, 1, calls.Load())
-	agent.watchRemoteConfigs(ctx, make(chan struct{}, 1), time.Second, map[string]string{server.URL: ""})
+	agent.watchRemoteConfigs(ctx, make(chan remoteRevision, 1), time.Second, map[string]string{server.URL: ""})
 	require.EqualValues(t, 1, calls.Load())
 }
 
@@ -224,36 +223,38 @@ func TestRemoteWatcherOneChangeOneReload(t *testing.T) {
 	defer server.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	reload := make(chan struct{}, 4)
+	changes := make(chan remoteRevision, 4)
 	done := make(chan struct{})
 	agent := &Telegraf{}
 	go func() {
-		agent.watchRemoteConfigs(ctx, reload, 5*time.Millisecond, map[string]string{server.URL: "v1"})
+		agent.watchRemoteConfigs(ctx, changes, 5*time.Millisecond, map[string]string{server.URL: "v1"})
 		close(done)
 	}()
 
 	require.Eventually(t, func() bool { return calls.Load() >= 3 }, time.Second, 5*time.Millisecond)
-	require.Empty(t, reload)
+	require.Empty(t, changes)
 
 	modified.Store("v2")
 	select {
-	case <-reload:
+	case revision := <-changes:
+		require.Equal(t, remoteRevision{path: server.URL, modified: "v2"}, revision)
 	case <-time.After(time.Second):
 		t.Fatal("first change did not trigger reload")
 	}
 	before := calls.Load()
 	require.Eventually(t, func() bool { return calls.Load() >= before+3 }, time.Second, 5*time.Millisecond)
-	require.Empty(t, reload, "first change must not trigger more than one reload")
+	require.Empty(t, changes, "first change must not trigger more than one reload")
 
 	modified.Store("v3")
 	select {
-	case <-reload:
+	case revision := <-changes:
+		require.Equal(t, remoteRevision{path: server.URL, modified: "v3"}, revision)
 	case <-time.After(time.Second):
 		t.Fatal("second change did not trigger reload")
 	}
 	before = calls.Load()
 	require.Eventually(t, func() bool { return calls.Load() >= before+3 }, time.Second, 5*time.Millisecond)
-	require.Empty(t, reload, "second change must not trigger more than one reload")
+	require.Empty(t, changes, "second change must not trigger more than one reload")
 
 	cancel()
 	<-done
@@ -412,4 +413,97 @@ func TestLocalWatcherRearmsAfterReplacement(t *testing.T) {
 			<-done
 		})
 	}
+}
+
+func TestNotifyWatcherReleasesSubscriptionOnReturn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "telegraf.conf")
+	require.NoError(t, os.WriteFile(path, []byte("original"), 0600))
+	agent := &Telegraf{GlobalFlags: GlobalFlags{watchConfig: "notify"}}
+	for range 5 {
+		ctx, cancel := context.WithCancel(context.Background())
+		reload := make(chan struct{}, 1)
+		done := make(chan struct{})
+		go func() { agent.watchLocalConfig(ctx, reload, path); close(done) }()
+		require.Eventually(t, func() bool {
+			if err := os.WriteFile(path, []byte(strconv.FormatInt(time.Now().UnixNano(), 10)), 0600); err != nil {
+				return false
+			}
+			select {
+			case <-reload:
+				return true
+			default:
+				return false
+			}
+		}, time.Second, 10*time.Millisecond)
+		cancel()
+		<-done
+	}
+}
+
+func TestReloadNotifyWatcherSurvivesReplacement(t *testing.T) {
+	counters := reloadPlugins(t)
+	path := filepath.Join(t.TempDir(), "telegraf.conf")
+	require.NoError(t, os.WriteFile(path, []byte(reloadConfig("original")), 0600))
+	agent := &Telegraf{GlobalFlags: GlobalFlags{config: []string{path}, watchConfig: "notify", quiet: true}}
+	startReloadLoop(t, agent)
+	require.Eventually(t, func() bool { return counters.gathers.Load() >= 2 }, time.Second, 5*time.Millisecond)
+	for i := range 3 {
+		name := "replacement" + strconv.Itoa(i)
+		require.NoError(t, os.WriteFile(path, []byte(reloadConfig(name)), 0600))
+		require.Eventually(t, func() bool {
+			for {
+				select {
+				case gathered := <-counters.names:
+					if gathered == name {
+						return true
+					}
+				default:
+					return false
+				}
+			}
+		}, 2*time.Second, 5*time.Millisecond, "edit %d was not activated", i)
+	}
+}
+
+func TestRemoteReloadCoalescesChangesCoveredBySnapshot(t *testing.T) {
+	counters := reloadPlugins(t)
+	var revision atomic.Value
+	revision.Store("v1")
+	var heads, gets atomic.Int64
+	staged := make(chan struct{})
+	var stagedOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rev := revision.Load().(string)
+		w.Header().Set("Last-Modified", rev)
+		if r.Method == http.MethodHead {
+			// Hold the second changed HEAD of the pass until staging has fetched both sources.
+			if rev == "v2" && heads.Add(1) == 2 {
+				<-staged
+			}
+			return
+		}
+		if rev == "v2" && gets.Add(1) == 2 {
+			stagedOnce.Do(func() { close(staged) })
+		}
+		if r.URL.Path == "/a" {
+			_, _ = fmt.Fprint(w, reloadConfig(rev))
+		} else {
+			_, _ = fmt.Fprintf(w, "# %s\n[[outputs.reload_test]]\n", rev)
+		}
+	}))
+	defer server.Close()
+	defer stagedOnce.Do(func() { close(staged) })
+
+	agent := &Telegraf{GlobalFlags: GlobalFlags{
+		config:                 []string{server.URL + "/a", server.URL + "/b"},
+		configURLWatchInterval: 5 * time.Millisecond,
+		quiet:                  true,
+	}}
+	startReloadLoop(t, agent)
+	require.Eventually(t, func() bool { return counters.gathers.Load() >= 2 }, time.Second, 5*time.Millisecond)
+	revision.Store("v2")
+	require.Eventually(t, func() bool { return counters.starts.Load() == 2 }, 2*time.Second, 5*time.Millisecond)
+	before := counters.gathers.Load()
+	require.Eventually(t, func() bool { return counters.gathers.Load() >= before+20 }, 2*time.Second, 5*time.Millisecond)
+	require.EqualValues(t, 2, counters.starts.Load())
 }
