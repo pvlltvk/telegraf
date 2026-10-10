@@ -88,6 +88,8 @@ func (l *logger) Level() telegraf.LogLevel {
 	if l.level != nil {
 		return *l.level
 	}
+	instance.Lock()
+	defer instance.Unlock()
 	return instance.level
 }
 
@@ -150,11 +152,6 @@ func (l *logger) Trace(args ...any) {
 }
 
 func (l *logger) Print(level telegraf.LogLevel, ts time.Time, args ...any) {
-	// Check if we are in early logging state and store the message in this case
-	if instance.impl == nil {
-		instance.add(level, ts, l.prefix, l.attributes, args...)
-	}
-
 	// Serve all registered callbacks before checking the log-level. This is
 	// intentional to allow the callback to apply its own log-level filtering.
 	callbackMu.RLock()
@@ -162,6 +159,13 @@ func (l *logger) Print(level telegraf.LogLevel, ts time.Time, args ...any) {
 		cb(level, ts.UTC(), l.source, l.attributes, args...)
 	}
 	callbackMu.RUnlock()
+
+	instance.Lock()
+	defer instance.Unlock()
+	// Check if we are in early logging state and store the message in this case
+	if instance.impl == nil {
+		instance.add(level, ts, l.prefix, l.attributes, args...)
+	}
 
 	// Skip all messages with insufficient log-levels
 	if l.level != nil && !l.level.Includes(level) || l.level == nil && !instance.level.Includes(level) {
@@ -294,16 +298,9 @@ func SetupLogging(cfg *Config) error {
 		return err
 	}
 
-	// Close the previous logger if possible
-	if err := CloseLogging(); err != nil {
-		return err
-	}
-
 	// Update the logging instance
 	skipEarlyLogs := cfg.LogFormat == "text" && cfg.Logfile == ""
-	instance.switchSink(l, cfg.logLevel, tz, skipEarlyLogs)
-
-	return nil
+	return instance.switchSink(l, cfg.logLevel, tz, skipEarlyLogs)
 }
 
 func RedirectLogging(w io.Writer) {

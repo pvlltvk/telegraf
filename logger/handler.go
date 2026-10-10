@@ -2,6 +2,7 @@ package logger
 
 import (
 	"container/list"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -50,14 +51,18 @@ func redirectHandler(w io.Writer) *handler {
 	}
 }
 
-func (h *handler) switchSink(impl sink, level telegraf.LogLevel, tz *time.Location, skipEarlyLogs bool) {
+func (h *handler) switchSink(impl sink, level telegraf.LogLevel, tz *time.Location, skipEarlyLogs bool) error {
+	h.Lock()
+	defer h.Unlock()
+	if err := h.closeSink(); err != nil && !errors.Is(err, os.ErrClosed) {
+		return err
+	}
 	// Setup the new sink etc
 	h.impl = impl
 	h.level = level
 	h.timezone = tz
 
 	// Use the new logger to output the early log-messages
-	h.Lock()
 	if !skipEarlyLogs && h.earlylogs.Len() > 0 {
 		current := h.earlylogs.Front()
 		for current != nil {
@@ -68,7 +73,7 @@ func (h *handler) switchSink(impl sink, level telegraf.LogLevel, tz *time.Locati
 			current = next
 		}
 	}
-	h.Unlock()
+	return nil
 }
 
 func (h *handler) add(level telegraf.LogLevel, ts time.Time, prefix string, attr map[string]any, args ...any) *entry {
@@ -80,25 +85,27 @@ func (h *handler) add(level telegraf.LogLevel, ts time.Time, prefix string, attr
 		args:       args,
 	}
 
-	h.Lock()
 	h.earlylogs.PushBack(e)
-	h.Unlock()
 
 	return e
 }
 
 func (h *handler) close() error {
+	h.Lock()
+	defer h.Unlock()
+	return h.closeSink()
+}
+
+func (h *handler) closeSink() error {
 	if h.impl == nil {
 		return nil
 	}
 
-	h.Lock()
 	current := h.earlylogs.Front()
 	for current != nil {
 		h.earlylogs.Remove(current)
 		current = h.earlylogs.Front()
 	}
-	h.Unlock()
 
 	if l, ok := h.impl.(io.Closer); ok {
 		return l.Close()
