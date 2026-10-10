@@ -167,7 +167,9 @@ func (c *Config) collectDeprecationInfo(category, name string, plugin any, all b
 
 func (c *Config) printUserDeprecation(category, name string, plugin any) error {
 	info := c.collectDeprecationInfo(category, name, plugin, false)
-	printPluginDeprecationNotice(info.logLevel, info.Name, info.info)
+	if !c.validationOnly {
+		printPluginDeprecationNotice(info.logLevel, info.Name, info.info)
+	}
 
 	if info.logLevel == telegraf.Error {
 		return errors.New("plugin deprecated")
@@ -176,7 +178,9 @@ func (c *Config) printUserDeprecation(category, name string, plugin any) error {
 	// Print deprecated options
 	deprecatedOptions := make([]string, 0)
 	for _, option := range info.Options {
-		PrintOptionDeprecationNotice(info.Name, option.Name, option.info)
+		if !c.validationOnly {
+			PrintOptionDeprecationNotice(info.Name, option.Name, option.info)
+		}
 		if option.logLevel == telegraf.Error {
 			deprecatedOptions = append(deprecatedOptions, option.Name)
 		}

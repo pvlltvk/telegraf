@@ -953,6 +953,7 @@ func fetchConfigContext(ctx context.Context, u *url.URL, urlRetryAttempts int, t
 	if err != nil {
 		return nil, "", err
 	}
+
 	if v, exists := os.LookupEnv("TELEGRAF_CONTROLLER_TOKEN"); exists {
 		req.Header.Add("Authorization", "Bearer "+v)
 	} else if v, exists := os.LookupEnv("INFLUX_TOKEN"); exists {
@@ -960,18 +961,19 @@ func fetchConfigContext(ctx context.Context, u *url.URL, urlRetryAttempts int, t
 	}
 	req.Header.Add("Accept", "application/toml")
 	req.Header.Set("User-Agent", internal.ProductToken())
+
 	var totalAttempts int
-	switch {
-	case urlRetryAttempts == -1:
+	if urlRetryAttempts == -1 {
 		totalAttempts = -1
 		log.Printf("Using unlimited number of attempts to fetch HTTP config")
-	case urlRetryAttempts == 0:
+	} else if urlRetryAttempts == 0 {
 		totalAttempts = 3
-	case urlRetryAttempts > 0:
+	} else if urlRetryAttempts > 0 {
 		totalAttempts = urlRetryAttempts
-	default:
+	} else {
 		return nil, "", fmt.Errorf("invalid number of attempts: %d", urlRetryAttempts)
 	}
+
 	for attempt := 0; ; attempt++ {
 		requestCtx, cancel := context.WithTimeout(ctx, timeout)
 		body, modified, err := requestURLConfigMetadata(req.WithContext(requestCtx))

@@ -78,7 +78,6 @@ type App interface {
 
 type Telegraf struct {
 	pprofErr <-chan error
-	ready    chan<- struct{}
 
 	inputFilters       []string
 	outputFilters      []string
@@ -167,7 +166,7 @@ func requestReload(reload chan<- struct{}) {
 	}
 }
 
-func (t *Telegraf) reloadLoop() error {
+func (t *Telegraf) reloadLoop(baselines map[string]string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	signals := make(chan os.Signal, 1)
@@ -200,32 +199,6 @@ func (t *Telegraf) reloadLoop() error {
 	})
 	defer func() { cancel(); workers.Wait() }()
 
-	var baselines map[string]string
-	if t.cfg == nil {
-		staged := t.stageConfiguration(ctx)
-		if staged.err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			return staged.err
-		}
-		if ctx.Err() != nil {
-			return nil
-		}
-		if err := t.activateConfiguration(staged); err != nil {
-			return err
-		}
-		baselines = staged.snapshot.LastModified
-	}
-
-	if t.ready != nil {
-		select {
-		case t.ready <- struct{}{}:
-		case <-ctx.Done():
-			return nil
-		}
-	}
-
 	localWatchers := make(map[string]localWatcher)
 	stopLocalWatcher := func(path string) {
 		w := localWatchers[path]
@@ -254,19 +227,21 @@ func (t *Telegraf) reloadLoop() error {
 				if isURL(path) {
 					continue
 				}
-				if _, err := os.Stat(path); err != nil {
-					log.Printf("W! Cannot watch config %s: %v", path, err)
-					continue
-				}
-				watched[path] = true
 				if w, ok := localWatchers[path]; ok {
 					select {
 					case <-w.done:
 						w.cancel()
 					default:
+						// A running watcher rearms itself when the file is briefly missing.
+						watched[path] = true
 						continue
 					}
 				}
+				if _, err := os.Stat(path); err != nil {
+					log.Printf("W! Cannot watch config %s: %v", path, err)
+					continue
+				}
+				watched[path] = true
 				watchCtx, cancel := context.WithCancel(ctx)
 				done := make(chan struct{})
 				localWatchers[path] = localWatcher{cancel: cancel, done: done}

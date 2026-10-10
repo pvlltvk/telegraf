@@ -12,12 +12,12 @@ import (
 )
 
 type configSource struct {
-	path  string
-	table *ast.Table
+	path string
+	data []byte
 }
 
-// Snapshot holds the source contents and environment substitutions validated
-// during staging. Loading it never reads files or contacts configuration servers.
+// Snapshot holds the raw source data validated during staging. Loading it
+// re-parses the bytes without reading files or contacting configuration servers.
 type Snapshot struct {
 	sources      []configSource
 	LastModified map[string]string
@@ -42,11 +42,11 @@ func (c *Config) Stage(ctx context.Context, timeout time.Duration, paths ...stri
 		if err != nil {
 			return nil, fmt.Errorf("loading config file %s failed: %w", path, err)
 		}
-		snapshot.sources = append(snapshot.sources, configSource{path: path, table: table})
+		snapshot.sources = append(snapshot.sources, configSource{path: path, data: file.data})
 		if file.remote {
 			snapshot.LastModified[path] = file.lastModified
 		}
-		if err := c.loadConfigTable(cloneTable(table), path); err != nil {
+		if err := c.loadConfigTable(table, path); err != nil {
 			return nil, fmt.Errorf("loading config file %s failed: %w", path, err)
 		}
 	}
@@ -61,73 +61,22 @@ func (c *Config) Stage(ctx context.Context, timeout time.Duration, paths ...stri
 
 func (s *Snapshot) Load(c *Config) error {
 	for _, source := range s.sources {
-		if err := c.loadConfigTable(cloneTable(source.table), source.path); err != nil {
+		publishSource(source.path)
+		if err := c.LoadConfigData(source.data, source.path); err != nil {
 			return fmt.Errorf("loading config file %s failed: %w", source.path, err)
 		}
-		publishSource(source.path)
 	}
 	return c.finishLoading()
-}
-
-func cloneTable(table *ast.Table) *ast.Table {
-	cloned := *table
-	cloned.Fields = make(map[string]any, len(table.Fields))
-	for key, value := range table.Fields {
-		cloned.Fields[key] = cloneNode(value)
-	}
-	return &cloned
-}
-
-func cloneNode(node any) any {
-	switch v := node.(type) {
-	case *ast.Table:
-		return cloneTable(v)
-	case []*ast.Table:
-		cloned := make([]*ast.Table, len(v))
-		for i, table := range v {
-			cloned[i] = cloneTable(table)
-		}
-		return cloned
-	case *ast.KeyValue:
-		cloned := *v
-		cloned.Value = cloneNode(v.Value).(ast.Value)
-		return &cloned
-	case *ast.Array:
-		cloned := *v
-		cloned.Value = make([]ast.Value, len(v.Value))
-		for i, value := range v.Value {
-			cloned.Value[i] = cloneNode(value).(ast.Value)
-		}
-		return &cloned
-	case *ast.String:
-		cloned := *v
-		return &cloned
-	case *ast.Integer:
-		cloned := *v
-		return &cloned
-	case *ast.Float:
-		cloned := *v
-		return &cloned
-	case *ast.Boolean:
-		cloned := *v
-		return &cloned
-	case *ast.Datetime:
-		cloned := *v
-		return &cloned
-	default:
-		return node
-	}
 }
 
 func (c *Config) unmarshalTable(table *ast.Table, target any) error {
 	if !c.validationOnly {
 		return c.toml.UnmarshalTable(table, target)
 	}
-	cloned := cloneTable(table)
-	if _, err := c.removeSecrets(cloned, reflect.TypeOf(target)); err != nil {
+	if _, err := c.removeSecrets(table, reflect.TypeOf(target)); err != nil {
 		return err
 	}
-	return c.toml.UnmarshalTable(cloned, target)
+	return c.toml.UnmarshalTable(table, target)
 }
 
 // Secret unmarshalling owns protected memory and global bookkeeping. Validate

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,8 +17,10 @@ import (
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/metric"
+	"github.com/influxdata/telegraf/plugins/aggregators"
 	"github.com/influxdata/telegraf/plugins/inputs"
 	"github.com/influxdata/telegraf/plugins/outputs"
+	"github.com/influxdata/telegraf/plugins/parsers"
 	"github.com/influxdata/telegraf/selfstat"
 )
 
@@ -51,11 +54,43 @@ func (*stagingOutput) Connect() error                { return nil }
 func (*stagingOutput) Close() error                  { return nil }
 func (*stagingOutput) Write([]telegraf.Metric) error { return nil }
 
+type stagingSerializerFuncOutput struct {
+	stagingOutput
+	serializerFunc telegraf.SerializerFunc
+}
+
+func (o *stagingSerializerFuncOutput) SetSerializerFunc(fn telegraf.SerializerFunc) {
+	o.serializerFunc = fn
+}
+
+type stagingAggregator struct{}
+
+func (*stagingAggregator) SampleConfig() string      { return "" }
+func (*stagingAggregator) Add(telegraf.Metric)       {}
+func (*stagingAggregator) Push(telegraf.Accumulator) {}
+func (*stagingAggregator) Reset()                    {}
+
+type stagingParserFuncInput struct {
+	stagingInput
+	parserFunc telegraf.ParserFunc
+}
+
+func (i *stagingParserFuncInput) SetParserFunc(fn telegraf.ParserFunc) { i.parserFunc = fn }
+
 func registerStagingPlugins(t *testing.T) {
 	t.Helper()
 	inputs.Inputs["reload_staging"] = func() telegraf.Input { return &stagingInput{} }
+	inputs.Inputs["staging_parser_func"] = func() telegraf.Input { return &stagingParserFuncInput{} }
 	outputs.Outputs["reload_staging"] = func() telegraf.Output { return &stagingOutput{} }
-	t.Cleanup(func() { delete(inputs.Inputs, "reload_staging"); delete(outputs.Outputs, "reload_staging") })
+	outputs.Outputs["reload_staging_serializer"] = func() telegraf.Output { return &stagingSerializerFuncOutput{} }
+	aggregators.Aggregators["reload_staging"] = func() telegraf.Aggregator { return &stagingAggregator{} }
+	t.Cleanup(func() {
+		delete(inputs.Inputs, "reload_staging")
+		delete(inputs.Inputs, "staging_parser_func")
+		delete(outputs.Outputs, "reload_staging")
+		delete(outputs.Outputs, "reload_staging_serializer")
+		delete(aggregators.Aggregators, "reload_staging")
+	})
 }
 
 func stagingFile(t *testing.T, data string) string {
@@ -111,6 +146,13 @@ func TestStageIsolatesSecretsAndSources(t *testing.T) {
 
 func TestStageRejectsInvalidOptions(t *testing.T) {
 	registerStagingPlugins(t)
+	creator, registered := parsers.Parsers["influx_upstream"]
+	delete(parsers.Parsers, "influx_upstream")
+	t.Cleanup(func() {
+		if registered {
+			parsers.Parsers["influx_upstream"] = creator
+		}
+	})
 	for _, tc := range []struct{ name, data, error string }{
 		{"syntax", "[[inputs.reload_staging]", ""},
 		{"missing input", "[[inputs.not_compiled]]", "undefined but requested input"},
@@ -119,17 +161,55 @@ func TestStageRejectsInvalidOptions(t *testing.T) {
 		{"missing secretstore", "[[secretstores.not_compiled]]\nid='unavailable'", "undefined but requested secretstores"},
 		{"missing output", "[[outputs.not_compiled]]", "undefined but requested output"},
 		{"unknown option", "[[inputs.reload_staging]]\n typo = 1", "but they were not used"},
-		{"model string type", "[[inputs.reload_staging]]\n alias = 3", "expecting string"},
-		{"model number type", "[[outputs.reload_staging]]\n metric_batch_size = false", "expecting int"},
+		{"type mismatch", "[[inputs.reload_staging]]\n count = false", ""},
+		{"model type", "[[inputs.reload_staging]]\n alias = 3\n[[outputs.reload_staging]]", "expecting string"},
 		{"model array type", "[[inputs.reload_staging]]\n namepass = [3]", "expecting string array"},
-		{"wrong type", "[[inputs.reload_staging]]\n count = false", ""},
 		{"secret type", "[[inputs.reload_staging]]\n token = []", "secret setting must be a string"},
 		{"ignored field", "[[inputs.reload_staging]]\n ignored = 'secret'", "cannot be set through TOML"},
 		{"dash key", "[[inputs.reload_staging]]\n \"-\" = 'secret'", "but they were not used"},
 		{"nested typo", "[[inputs.reload_staging]]\n [inputs.reload_staging.nested]\n typo = 1", "but they were not used"},
+		{
+			"unavailable parser",
+			"[[inputs.staging_parser_func]]\n data_format='influx'\n influx_parser_type='upstream'\n[[outputs.reload_staging]]",
+			"parser not found",
+		},
+		{
+			"unavailable serializer",
+			"[[inputs.reload_staging]]\n[[outputs.reload_staging_serializer]]\n data_format='unavailable'",
+			"serializer not found",
+		},
+		{
+			"negative input interval",
+			"[[inputs.reload_staging]]\n interval='-1s'\n[[outputs.reload_staging]]",
+			"interval must not be negative",
+		},
+		{
+			"input startup_error_behavior",
+			"[[inputs.reload_staging]]\n startup_error_behavior='bogus'\n[[outputs.reload_staging]]",
+			"invalid 'startup_error_behavior'",
+		},
+		{
+			"output startup_error_behavior",
+			"[[inputs.reload_staging]]\n[[outputs.reload_staging]]\n startup_error_behavior='bogus'",
+			"invalid 'startup_error_behavior'",
+		},
+		{
+			"negative buffer limit",
+			"[[inputs.reload_staging]]\n[[outputs.reload_staging]]\n metric_buffer_limit=-1",
+			"must not be negative",
+		},
+		{
+			"zero aggregator period",
+			"[[inputs.reload_staging]]\n[[outputs.reload_staging]]\n[[aggregators.reload_staging]]\n period='0s'",
+			"period must be positive",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := NewStagingConfig().Stage(context.Background(), time.Second, stagingFile(t, tc.data))
+			c := NewStagingConfig()
+			_, err := c.Stage(context.Background(), time.Second, stagingFile(t, tc.data))
+			if err == nil {
+				err = c.Validate()
+			}
 			require.Error(t, err)
 			if tc.error != "" {
 				require.ErrorContains(t, err, tc.error)
@@ -138,30 +218,41 @@ func TestStageRejectsInvalidOptions(t *testing.T) {
 	}
 }
 
-func TestSnapshotUsesValidatedEnvironmentAndSources(t *testing.T) {
+func TestSnapshotDoesNotRefetchRemoteSource(t *testing.T) {
 	registerStagingPlugins(t)
-	t.Setenv("RELOAD_STAGING_NAME", "validated")
-	first := stagingFile(t, `[[inputs.reload_staging]]
- name = "${RELOAD_STAGING_NAME}"
- [[outputs.reload_staging]]
-`)
-	second := stagingFile(t, `[[inputs.reload_staging]]
- name = "second"
-`)
-	c := NewStagingConfig()
-	snapshot, err := c.Stage(context.Background(), time.Second, first, second)
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) != 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Last-Modified", "accepted-version")
+		_, _ = fmt.Fprint(w, "[[inputs.reload_staging]]\nname='validated'\n[[outputs.reload_staging]]")
+	}))
+	defer server.Close()
+	snapshot, err := NewStagingConfig().Stage(context.Background(), time.Second, server.URL)
 	require.NoError(t, err)
-	t.Setenv("RELOAD_STAGING_NAME", "changed")
-	require.NoError(t, os.Remove(first))
-	require.NoError(t, os.Remove(second))
 	loaded := NewConfig()
 	require.NoError(t, snapshot.Load(loaded))
 	defer loaded.Outputs[0].Close()
-	require.Len(t, loaded.Inputs, 2)
+	require.EqualValues(t, 1, requests.Load())
+	require.Equal(t, "accepted-version", snapshot.LastModified[server.URL])
 	require.Equal(t, "validated", loaded.Inputs[0].Input.(*stagingInput).Name)
-	require.Equal(t, "second", loaded.Inputs[1].Input.(*stagingInput).Name)
-	require.Equal(t, []string{first, second}, GetSources())
-	require.ErrorContains(t, loaded.Inputs[0].Init(), "activation only")
+}
+
+func TestSnapshotLoadsFromBytesAfterLocalFileChanges(t *testing.T) {
+	registerStagingPlugins(t)
+	path := stagingFile(t, "[[inputs.reload_staging]]\ntoken='secret'\nname='original'\n[[outputs.reload_staging]]")
+	snapshot, err := NewStagingConfig().Stage(context.Background(), time.Second, path)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, []byte("modified"), 0600))
+	require.NoError(t, os.Remove(path))
+	loaded := NewConfig()
+	require.NoError(t, snapshot.Load(loaded))
+	defer loaded.Outputs[0].Close()
+	loadedInput := loaded.Inputs[0].Input.(*stagingInput)
+	require.Equal(t, "original", loadedInput.Name)
+	require.NotNil(t, loadedInput.Token.container)
 }
 
 func TestStageDoesNotOpenDiskBufferOrResetStatistics(t *testing.T) {

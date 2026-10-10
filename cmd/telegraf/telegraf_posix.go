@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"runtime"
 	"syscall"
@@ -12,7 +13,14 @@ func (t *Telegraf) Run() error {
 	stop = make(chan struct{})
 	defer close(stop)
 
-	return t.reloadLoop()
+	staged := t.stageConfiguration(context.Background())
+	if staged.err != nil {
+		return staged.err
+	}
+	if err := t.activateConfiguration(staged); err != nil {
+		return err
+	}
+	return t.reloadLoop(staged.snapshot.LastModified)
 }
 
 func getLockedMemoryLimit() uint64 {
